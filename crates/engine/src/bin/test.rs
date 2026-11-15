@@ -135,6 +135,282 @@ fn nvfp4_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
     check(&output.download()?, &expected, 0.01, 0.02)
 }
 
+fn nvfp4_w4a4_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
+    let (n, k) = (32, 256);
+    let input_host = reference::values(k, 31);
+    let input_scale = 0.0013892765f32;
+    let input_scale_inv = input_scale.recip();
+    let (input_packed_host, input_scales_host) =
+        reference::nvfp4_quantize(&input_host, input_scale_inv);
+    let packed_host: Vec<u8> = (0..n * k / 2).map(|x| (x * 37 % 256) as u8).collect();
+    let scale_values = [0x38u8, 0x30, 0x40, 0x34];
+    let scales_host: Vec<u8> = (0..n * k / 16).map(|x| scale_values[x % 4]).collect();
+    let expected = reference::nvfp4_gemv_w4a4(
+        &input_host,
+        input_scale,
+        input_scale_inv,
+        &packed_host,
+        &scales_host,
+        0.75,
+        n,
+        k,
+    );
+    let input_packed = Buffer::from_host(&input_packed_host)?;
+    let input_scales = Buffer::from_host(&input_scales_host)?;
+    let packed = Buffer::from_host(&packed_host)?;
+    let scales = Buffer::from_host(&scales_host)?;
+    let global = Buffer::from_host(&[0.75f32])?;
+    let output = Buffer::alloc(n)?;
+    components::nvfp4_gemv_w4a4(
+        kernels,
+        stream,
+        input_packed.ptr(),
+        input_scales.ptr(),
+        Nvfp4Matrix {
+            weight: packed.ptr(),
+            scales: scales.ptr(),
+            global_scale: global.ptr(),
+            n,
+            k,
+        },
+        input_scale,
+        output.ptr(),
+    )?;
+    stream.synchronize()?;
+    check(&output.download()?, &expected, 0.01, 0.02)
+}
+
+fn nvfp4_fused_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
+    let (n, k) = (32, 2560);
+    let input_host = reference::values(k, 31);
+    let gate_host: Vec<u8> = (0..n * k / 2).map(|x| (x * 37 % 256) as u8).collect();
+    let up_host: Vec<u8> = (0..n * k / 2).map(|x| (x * 53 % 256) as u8).collect();
+    let down_host: Vec<u8> = (0..n * k / 2).map(|x| (x * 71 % 256) as u8).collect();
+    let scale_values = [0x38u8, 0x30, 0x40, 0x34];
+    let scales_host: Vec<u8> = (0..n * k / 16).map(|x| scale_values[x % 4]).collect();
+    let down_scales_host: Vec<u8> = (0..n * k / 16).map(|x| scale_values[x % 4]).collect();
+    let gate_expected = reference::nvfp4_gemv(&input_host, &gate_host, &scales_host, 0.75, n, k);
+    let up_expected = reference::nvfp4_gemv(&input_host, &up_host, &scales_host, 0.75, n, k);
+    let intermediate_expected: Vec<bf16> = gate_expected
+        .iter()
+        .zip(up_expected.iter())
+        .map(|(gate, up)| {
+            let gate = gate.to_f32();
+            bf16::from_f32(gate / (1.0 + (-gate).exp()) * up.to_f32())
+        })
+        .collect();
+    let down_expected =
+        reference::nvfp4_gemv(&input_host, &down_host, &down_scales_host, 0.75, n, k);
+    let input = Buffer::from_host(&input_host)?;
+    let gate = Buffer::from_host(&gate_host)?;
+    let up = Buffer::from_host(&up_host)?;
+    let down = Buffer::from_host(&down_host)?;
+    let scales = Buffer::from_host(&scales_host)?;
+    let down_scales = Buffer::from_host(&down_scales_host)?;
+    let global = Buffer::from_host(&[0.75f32])?;
+    let matrix = |weight| qwen_ultrafast_engine::weights::ExpertDeviceMatrix {
+        weight,
+        scales: scales.ptr(),
+        global_scale: global.ptr(),
+    };
+    let gate_table = Buffer::from_host(&[matrix(gate.ptr())])?;
+    let up_table = Buffer::from_host(&[matrix(up.ptr())])?;
+    let down_table = Buffer::from_host(&[qwen_ultrafast_engine::weights::ExpertDeviceMatrix {
+        weight: down.ptr(),
+        scales: down_scales.ptr(),
+        global_scale: global.ptr(),
+    }])?;
+    let ids = Buffer::from_host(&[0u32; 10])?;
+    let expert_weights = Buffer::from_host(&[0.3f32; 10])?;
+    let intermediate = Buffer::alloc(n)?;
+    let accumulation = Buffer::from_host(&vec![0.0f32; n])?;
+    components::nvfp4_gate_up_indirect(
+        kernels,
+        stream,
+        input.ptr(),
+        gate_table.ptr(),
+        up_table.ptr(),
+        ids.ptr(),
+        0,
+        intermediate.ptr(),
+        n,
+        k,
+    )?;
+    components::nvfp4_down_accumulate_indirect(
+        kernels,
+        stream,
+        input.ptr(),
+        down_table.ptr(),
+        ids.ptr(),
+        0,
+        expert_weights.ptr(),
+        accumulation.ptr(),
+        n,
+        k,
+    )?;
+    let old_gate_up = Buffer::<bf16>::alloc(2 * n)?;
+    let old_intermediate = Buffer::<bf16>::alloc(n)?;
+    let old_down = Buffer::<bf16>::alloc(n)?;
+    let old_accumulation = Buffer::from_host(&vec![0.0f32; n])?;
+    components::nvfp4_gemv_indirect(
+        kernels,
+        stream,
+        input.ptr(),
+        gate_table.ptr(),
+        ids.ptr(),
+        0,
+        old_gate_up.ptr(),
+        n,
+        k,
+    )?;
+    components::nvfp4_gemv_indirect(
+        kernels,
+        stream,
+        input.ptr(),
+        up_table.ptr(),
+        ids.ptr(),
+        0,
+        old_gate_up.ptr() + (n * 2) as u64,
+        n,
+        k,
+    )?;
+    qwen_ultrafast_engine::ops::swiglu(
+        kernels,
+        stream,
+        old_gate_up.ptr(),
+        old_intermediate.ptr(),
+        n,
+    )?;
+    components::nvfp4_gemv_indirect(
+        kernels,
+        stream,
+        input.ptr(),
+        down_table.ptr(),
+        ids.ptr(),
+        0,
+        old_down.ptr(),
+        n,
+        k,
+    )?;
+    components::expert_accumulate_indirect(
+        kernels,
+        stream,
+        old_down.ptr(),
+        expert_weights.ptr(),
+        0,
+        old_accumulation.ptr(),
+        n,
+    )?;
+    stream.synchronize()?;
+    ensure!(
+        intermediate.download()? == old_intermediate.download()?,
+        "fused gate/up is not bit-exact with the split kernels"
+    );
+    ensure!(
+        accumulation.download()? == old_accumulation.download()?,
+        "fused down is not bit-exact with the split kernels"
+    );
+    let intermediate_error = check(
+        &intermediate.download()?,
+        &intermediate_expected,
+        0.01,
+        0.02,
+    )?;
+    let accumulation_expected: Vec<bf16> = down_expected
+        .iter()
+        .map(|value| bf16::from_f32(value.to_f32() * bf16::from_f32(0.3).to_f32()))
+        .collect();
+    let accumulated: Vec<bf16> = accumulation
+        .download()?
+        .iter()
+        .map(|value| bf16::from_f32(*value))
+        .collect();
+    let down_error = check(&accumulated, &accumulation_expected, 0.01, 0.02)?;
+    for slot in 1..10 {
+        components::nvfp4_down_accumulate_indirect(
+            kernels,
+            stream,
+            input.ptr(),
+            down_table.ptr(),
+            ids.ptr(),
+            slot,
+            expert_weights.ptr(),
+            accumulation.ptr(),
+            n,
+            k,
+        )?;
+        components::nvfp4_gemv_indirect(
+            kernels,
+            stream,
+            input.ptr(),
+            down_table.ptr(),
+            ids.ptr(),
+            slot,
+            old_down.ptr(),
+            n,
+            k,
+        )?;
+        components::expert_accumulate_indirect(
+            kernels,
+            stream,
+            old_down.ptr(),
+            expert_weights.ptr(),
+            slot,
+            old_accumulation.ptr(),
+            n,
+        )?;
+    }
+    stream.synchronize()?;
+    ensure!(
+        accumulation.download()? == old_accumulation.download()?,
+        "fused down differs after multiple expert accumulations"
+    );
+    Ok(intermediate_error.max(down_error))
+}
+
+fn nvfp4_quantize_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
+    let count = 256;
+    let input_host = reference::values(count, 97);
+    let input_scale_inv = 0.0013892765f32.recip();
+    let (expected_packed, expected_scales) =
+        reference::nvfp4_quantize(&input_host, input_scale_inv);
+    let input = Buffer::from_host(&input_host)?;
+    let packed = Buffer::<u8>::alloc(count / 2)?;
+    let scales = Buffer::<u8>::alloc(count / 16)?;
+    components::nvfp4_quantize(
+        kernels,
+        stream,
+        input.ptr(),
+        input_scale_inv,
+        packed.ptr(),
+        scales.ptr(),
+        count,
+    )?;
+    stream.synchronize()?;
+    let actual_packed = packed.download()?;
+    let actual_scales = scales.download()?;
+    ensure!(
+        actual_packed == expected_packed,
+        "NVFP4 packed values differ: actual={actual_packed:?} expected={expected_packed:?}"
+    );
+    ensure!(
+        actual_scales == expected_scales,
+        "NVFP4 scales differ: actual={actual_scales:?} expected={expected_scales:?}"
+    );
+    if let Some(path) = std::env::var_os("QWEN_NVFP4_DUMP") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "input": input_host.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
+                "packed": actual_packed,
+                "scales": actual_scales,
+                "input_scale_inv": input_scale_inv,
+            }))?,
+        )?;
+    }
+    Ok(0.0)
+}
+
 fn router_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
     let logits_host = reference::values(512, 37);
     let logits = Buffer::from_host(&logits_host)?;
@@ -386,6 +662,12 @@ fn main() -> Result<()> {
     let mut errors = BTreeMap::new();
     errors.insert("gdn_recurrence", gdn_test(&kernels, &stream)?);
     errors.insert("nvfp4_gemv", nvfp4_test(&kernels, &stream)?);
+    errors.insert("nvfp4_w4a4_gemv", nvfp4_w4a4_test(&kernels, &stream)?);
+    errors.insert("nvfp4_fused_expert", nvfp4_fused_test(&kernels, &stream)?);
+    errors.insert(
+        "nvfp4_activation_quantization",
+        nvfp4_quantize_test(&kernels, &stream)?,
+    );
     errors.insert("router_top10", router_test(&kernels, &stream)?);
     errors.insert("gdn_convolution", gdn_conv_test(&kernels, &stream)?);
     errors.insert("qsa_single_token", qsa_test(&kernels, &stream)?);

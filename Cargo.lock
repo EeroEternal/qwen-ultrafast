@@ -459,6 +459,7 @@ name = "qwen-ultrafast-nccl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "libloading",
  "qwen-ultrafast-cuda",
 ]

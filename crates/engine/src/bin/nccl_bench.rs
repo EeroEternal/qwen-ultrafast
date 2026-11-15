@@ -27,9 +27,7 @@ fn main() -> Result<()> {
                     .then(|| Buffer::from_host(&vec![rank as f32 + 1.0; 2560]))
                     .transpose()?;
                 let bf16_buffer = bf16_mode
-                    .then(|| {
-                        Buffer::from_host(&vec![bf16::from_f32(rank as f32 + 1.0); 2560])
-                    })
+                    .then(|| Buffer::from_host(&vec![bf16::from_f32(rank as f32 + 1.0); 2560]))
                     .transpose()?;
                 let graph = if let Some(buffer) = &bf16_buffer {
                     stream.begin_capture()?;
@@ -65,7 +63,11 @@ fn main() -> Result<()> {
         }
         let mut elapsed: f64 = 0.0;
         for worker in workers {
-            elapsed = elapsed.max(worker.join().map_err(|_| anyhow::anyhow!("worker panicked"))??);
+            elapsed = elapsed.max(
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("worker panicked"))??,
+            );
         }
         println!(
             "{}",

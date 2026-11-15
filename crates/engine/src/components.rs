@@ -135,6 +135,57 @@ pub fn nvfp4_gemv(
     )
 }
 
+pub fn nvfp4_quantize(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    input_scale_inv: f32,
+    packed: DevicePtr,
+    scales: DevicePtr,
+    count: usize,
+) -> Result<()> {
+    launch_kernel(
+        kernels.nvfp4_quantize,
+        stream,
+        ((count / 16).div_ceil(32) as u32, 1, 1),
+        32,
+        &mut Args::new()
+            .u64(input)
+            .f32(input_scale_inv)
+            .u64(packed)
+            .u64(scales)
+            .u32(count as u32),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_gemv_w4a4(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    input_scales: DevicePtr,
+    weight: Nvfp4Matrix,
+    input_scale: f32,
+    output: DevicePtr,
+) -> Result<()> {
+    launch_kernel(
+        kernels.nvfp4_gemv_w4a4,
+        stream,
+        (weight.n as u32, 1, 1),
+        128,
+        &mut Args::new()
+            .u64(input)
+            .u64(input_scales)
+            .u64(weight.weight)
+            .u64(weight.scales)
+            .u64(weight.global_scale)
+            .f32(input_scale)
+            .u64(output)
+            .u32(weight.n as u32)
+            .u32(weight.k as u32),
+    )
+}
+
 pub fn clear_f32(
     kernels: &Kernels,
     stream: &Stream,
@@ -495,6 +546,98 @@ pub fn nvfp4_gemv_indirect(
             .u64(expert_ids)
             .u32(slot as u32)
             .u64(output)
+            .u32(n as u32)
+            .u32(k as u32),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_gemv_w4a4_indirect(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    input_scales: DevicePtr,
+    table: DevicePtr,
+    expert_ids: DevicePtr,
+    slot: usize,
+    input_scale: f32,
+    output: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    launch_kernel(
+        kernels.nvfp4_gemv_w4a4_indirect,
+        stream,
+        (n as u32, 1, 1),
+        128,
+        &mut Args::new()
+            .u64(input)
+            .u64(input_scales)
+            .u64(table)
+            .u64(expert_ids)
+            .u32(slot as u32)
+            .f32(input_scale)
+            .u64(output)
+            .u32(n as u32)
+            .u32(k as u32),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_gate_up_indirect(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    gate_table: DevicePtr,
+    up_table: DevicePtr,
+    expert_ids: DevicePtr,
+    slot: usize,
+    output: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    launch_kernel(
+        kernels.nvfp4_gate_up_indirect,
+        stream,
+        (n as u32, 1, 1),
+        128,
+        &mut Args::new()
+            .u64(input)
+            .u64(gate_table)
+            .u64(up_table)
+            .u64(expert_ids)
+            .u32(slot as u32)
+            .u64(output)
+            .u32(n as u32)
+            .u32(k as u32),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_down_accumulate_indirect(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    table: DevicePtr,
+    expert_ids: DevicePtr,
+    slot: usize,
+    expert_weights: DevicePtr,
+    accumulation: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    launch_kernel(
+        kernels.nvfp4_down_accumulate_indirect,
+        stream,
+        (n as u32, 1, 1),
+        128,
+        &mut Args::new()
+            .u64(input)
+            .u64(table)
+            .u64(expert_ids)
+            .u32(slot as u32)
+            .u64(expert_weights)
+            .u64(accumulation)
             .u32(n as u32)
             .u32(k as u32),
     )

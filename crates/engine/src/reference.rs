@@ -143,3 +143,114 @@ pub fn nvfp4_gemv(
     }
     output
 }
+
+pub fn nvfp4_quantize(input: &[bf16], input_scale_inv: f32) -> (Vec<u8>, Vec<u8>) {
+    const FP4: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    let fp8 = |raw: u8| {
+        let exponent = ((raw >> 3) & 15) as i32;
+        let mantissa = (raw & 7) as f32;
+        if exponent == 0 {
+            mantissa * 2.0f32.powi(-9)
+        } else {
+            (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
+        }
+    };
+    let nearest = |value: f32, values: &[f32]| {
+        let mut best = 0;
+        let mut error = f32::INFINITY;
+        for (index, candidate) in values.iter().enumerate() {
+            let candidate_error = (value - candidate).abs();
+            if candidate_error < error
+                || (candidate_error == error && best % 2 == 1 && index % 2 == 0)
+            {
+                best = index;
+                error = candidate_error;
+            }
+        }
+        best
+    };
+    let fp8_values: Vec<f32> = (0..=0x7e).map(fp8).collect();
+    let mut packed = Vec::with_capacity(input.len() / 2);
+    let mut scales = Vec::with_capacity(input.len() / 16);
+    for group in 0..input.len() / 16 {
+        let values = &input[group * 16..(group + 1) * 16];
+        let maximum = values
+            .iter()
+            .map(|value| value.to_f32().abs())
+            .fold(0.0f32, f32::max);
+        let raw_scale = nearest(maximum * input_scale_inv / 6.0, &fp8_values) as u8;
+        scales.push(raw_scale);
+        let inverse = if raw_scale == 0 {
+            0.0
+        } else {
+            input_scale_inv / fp8(raw_scale)
+        };
+        for pair in 0..8 {
+            let low = values[2 * pair].to_f32() * inverse;
+            let high = values[2 * pair + 1].to_f32() * inverse;
+            let mut low = nearest(low, &FP4);
+            let mut high = nearest(high, &FP4);
+            if low == 0 && values[2 * pair].to_f32().is_sign_negative() {
+                low = 8;
+            }
+            if high == 0 && values[2 * pair + 1].to_f32().is_sign_negative() {
+                high = 8;
+            }
+            packed.push((low | (high << 4)) as u8);
+        }
+    }
+    (packed, scales)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_gemv_w4a4(
+    input: &[bf16],
+    input_scale: f32,
+    input_scale_inv: f32,
+    packed: &[u8],
+    scales: &[u8],
+    global_scale: f32,
+    n: usize,
+    k: usize,
+) -> Vec<bf16> {
+    const FP4: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    let fp8 = |raw: u8| {
+        let exponent = ((raw >> 3) & 15) as i32;
+        let mantissa = (raw & 7) as f32;
+        if exponent == 0 {
+            mantissa * 2.0f32.powi(-9)
+        } else {
+            (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
+        }
+    };
+    let (input_packed, input_scales) = nvfp4_quantize(input, input_scale_inv);
+    let mut output = vec![bf16::ZERO; n];
+    for column in 0..n {
+        let mut sum = 0.0f32;
+        for group in 0..k / 16 {
+            let mut dot = 0.0f32;
+            for j in 0..16 {
+                let input_byte = input_packed[group * 8 + j / 2];
+                let weight_byte = packed[column * (k / 2) + group * 8 + j / 2];
+                let input_code = if j % 2 == 0 {
+                    input_byte & 15
+                } else {
+                    input_byte >> 4
+                };
+                let weight_code = if j % 2 == 0 {
+                    weight_byte & 15
+                } else {
+                    weight_byte >> 4
+                };
+                dot += FP4[input_code as usize] * FP4[weight_code as usize];
+            }
+            sum += fp8(input_scales[group]) * fp8(scales[column * (k / 16) + group]) * dot;
+        }
+        output[column] = bf16::from_f32(sum * global_scale * input_scale);
+    }
+    output
+}

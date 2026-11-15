@@ -17,6 +17,7 @@ struct Options {
     max_sequence: usize,
     load_only: bool,
     graph: bool,
+    w4a4: bool,
 }
 
 fn options() -> Result<Options> {
@@ -28,6 +29,7 @@ fn options() -> Result<Options> {
         max_sequence: 2048,
         load_only: false,
         graph: false,
+        w4a4: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -55,6 +57,11 @@ fn options() -> Result<Options> {
             }
             "--graph" => {
                 options.graph = true;
+                index += 1;
+                continue;
+            }
+            "--w4a4" => {
+                options.w4a4 = true;
                 index += 1;
                 continue;
             }
@@ -131,6 +138,7 @@ fn main() -> Result<()> {
                     checkpoint,
                     config,
                     options.max_sequence,
+                    options.w4a4,
                 ) {
                     Ok(runtime) => runtime,
                     Err(error) => {

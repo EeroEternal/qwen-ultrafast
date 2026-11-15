@@ -45,6 +45,11 @@ pub struct Runtime<'a> {
     value: Buffer<bf16>,
     gate_up: Buffer<bf16>,
     intermediate: Buffer<bf16>,
+    quantized_mixed: Buffer<u8>,
+    mixed_scales: Buffer<u8>,
+    quantized_intermediate: Buffer<u8>,
+    intermediate_scales: Buffer<u8>,
+    w4a4: bool,
     router_logits: Buffer<bf16>,
     expert_ids: Buffer<u32>,
     expert_weights: Buffer<f32>,
@@ -81,6 +86,7 @@ impl<'a> Runtime<'a> {
         checkpoint: &'a Checkpoint,
         config: Config,
         max_sequence: usize,
+        w4a4: bool,
     ) -> Result<Self> {
         ensure!(
             max_sequence > 0 && max_sequence <= 2048,
@@ -199,6 +205,11 @@ impl<'a> Runtime<'a> {
                 text.moe_intermediate_size
                     .max(text.shared_expert_intermediate_size),
             )?,
+            quantized_mixed: Buffer::alloc(hidden / 2)?,
+            mixed_scales: Buffer::alloc(hidden / 16)?,
+            quantized_intermediate: Buffer::alloc(text.moe_intermediate_size / 2)?,
+            intermediate_scales: Buffer::alloc(text.moe_intermediate_size / 16)?,
+            w4a4,
             router_logits: Buffer::alloc(text.num_experts)?,
             expert_ids: Buffer::alloc(text.num_experts_per_tok)?,
             expert_weights: Buffer::alloc(text.num_experts_per_tok)?,
@@ -628,56 +639,159 @@ impl<'a> Runtime<'a> {
             self.routed.ptr(),
             text.hidden_size,
         )?;
+        if self.w4a4 {
+            components::nvfp4_quantize(
+                &self.kernels,
+                &self.stream,
+                self.mixed.ptr(),
+                weights.input_scale.recip(),
+                self.quantized_mixed.ptr(),
+                self.mixed_scales.ptr(),
+                text.hidden_size,
+            )?;
+        }
         for slot in 0..text.num_experts_per_tok {
-            components::nvfp4_gemv_indirect(
-                &self.kernels,
-                &self.stream,
-                self.mixed.ptr(),
-                weights.gate_table,
-                self.expert_ids.ptr(),
-                slot,
-                self.gate_up.ptr(),
-                text.moe_intermediate_size,
-                text.hidden_size,
-            )?;
-            components::nvfp4_gemv_indirect(
-                &self.kernels,
-                &self.stream,
-                self.mixed.ptr(),
-                weights.up_table,
-                self.expert_ids.ptr(),
-                slot,
-                self.gate_up.ptr() + (text.moe_intermediate_size * 2) as u64,
-                text.moe_intermediate_size,
-                text.hidden_size,
-            )?;
-            ops::swiglu(
-                &self.kernels,
-                &self.stream,
-                self.gate_up.ptr(),
-                self.intermediate.ptr(),
-                text.moe_intermediate_size,
-            )?;
-            components::nvfp4_gemv_indirect(
-                &self.kernels,
-                &self.stream,
-                self.intermediate.ptr(),
-                weights.down_table,
-                self.expert_ids.ptr(),
-                slot,
-                self.block.ptr(),
-                text.hidden_size,
-                text.moe_intermediate_size,
-            )?;
-            components::expert_accumulate_indirect(
-                &self.kernels,
-                &self.stream,
-                self.block.ptr(),
-                self.expert_weights.ptr(),
-                slot,
-                self.routed.ptr(),
-                text.hidden_size,
-            )?;
+            if self.w4a4 {
+                components::nvfp4_gemv_w4a4_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.quantized_mixed.ptr(),
+                    self.mixed_scales.ptr(),
+                    weights.gate_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    weights.input_scale,
+                    self.gate_up.ptr(),
+                    text.moe_intermediate_size,
+                    text.hidden_size,
+                )?;
+                components::nvfp4_gemv_w4a4_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.quantized_mixed.ptr(),
+                    self.mixed_scales.ptr(),
+                    weights.up_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    weights.input_scale,
+                    self.gate_up.ptr() + (text.moe_intermediate_size * 2) as u64,
+                    text.moe_intermediate_size,
+                    text.hidden_size,
+                )?;
+                ops::swiglu(
+                    &self.kernels,
+                    &self.stream,
+                    self.gate_up.ptr(),
+                    self.intermediate.ptr(),
+                    text.moe_intermediate_size,
+                )?;
+                components::nvfp4_quantize(
+                    &self.kernels,
+                    &self.stream,
+                    self.intermediate.ptr(),
+                    weights.down_input_scale.recip(),
+                    self.quantized_intermediate.ptr(),
+                    self.intermediate_scales.ptr(),
+                    text.moe_intermediate_size,
+                )?;
+                components::nvfp4_gemv_w4a4_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.quantized_intermediate.ptr(),
+                    self.intermediate_scales.ptr(),
+                    weights.down_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    weights.down_input_scale,
+                    self.block.ptr(),
+                    text.hidden_size,
+                    text.moe_intermediate_size,
+                )?;
+                components::expert_accumulate_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.block.ptr(),
+                    self.expert_weights.ptr(),
+                    slot,
+                    self.routed.ptr(),
+                    text.hidden_size,
+                )?;
+            } else if std::env::var_os("QWEN_UNFUSED_MOE").is_some() {
+                components::nvfp4_gemv_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.mixed.ptr(),
+                    weights.gate_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    self.gate_up.ptr(),
+                    text.moe_intermediate_size,
+                    text.hidden_size,
+                )?;
+                components::nvfp4_gemv_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.mixed.ptr(),
+                    weights.up_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    self.gate_up.ptr() + (text.moe_intermediate_size * 2) as u64,
+                    text.moe_intermediate_size,
+                    text.hidden_size,
+                )?;
+                ops::swiglu(
+                    &self.kernels,
+                    &self.stream,
+                    self.gate_up.ptr(),
+                    self.intermediate.ptr(),
+                    text.moe_intermediate_size,
+                )?;
+                components::nvfp4_gemv_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.intermediate.ptr(),
+                    weights.down_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    self.block.ptr(),
+                    text.hidden_size,
+                    text.moe_intermediate_size,
+                )?;
+                components::expert_accumulate_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.block.ptr(),
+                    self.expert_weights.ptr(),
+                    slot,
+                    self.routed.ptr(),
+                    text.hidden_size,
+                )?;
+            } else {
+                components::nvfp4_gate_up_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.mixed.ptr(),
+                    weights.gate_table,
+                    weights.up_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    self.intermediate.ptr(),
+                    text.moe_intermediate_size,
+                    text.hidden_size,
+                )?;
+                components::nvfp4_down_accumulate_indirect(
+                    &self.kernels,
+                    &self.stream,
+                    self.intermediate.ptr(),
+                    weights.down_table,
+                    self.expert_ids.ptr(),
+                    slot,
+                    self.expert_weights.ptr(),
+                    self.routed.ptr(),
+                    text.hidden_size,
+                    text.moe_intermediate_size,
+                )?;
+            }
         }
         reducer(&self.kernels, &self.stream, &self.routed)?;
         components::moe_finish(
@@ -740,10 +854,26 @@ impl<'a> Runtime<'a> {
                 })
                 .sum::<f64>();
             let first: Vec<f32> = values.iter().take(8).map(|value| value.to_f32()).collect();
-            eprintln!(
-                "layer {layer} {stage} square_sum={square_sum:.9e} first={first:?}"
-            );
+            eprintln!("layer {layer} {stage} square_sum={square_sum:.9e} first={first:?}");
         }
+        Ok(())
+    }
+
+    fn trace_logits(&self) -> Result<()> {
+        if self.rank != 0 || std::env::var_os("QWEN_TRACE_VALUES").is_none() {
+            return Ok(());
+        }
+        self.stream.synchronize()?;
+        let step = self.state.download()?[0].step;
+        let logits = self.logits.download()?;
+        let mut top: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(id, value)| (id as u32, *value))
+            .collect();
+        top.sort_by(|left, right| right.1.total_cmp(&left.1));
+        top.truncate(10);
+        eprintln!("step {step} logits top={top:?}");
         Ok(())
     }
 
@@ -797,6 +927,7 @@ impl<'a> Runtime<'a> {
             self.logits.ptr(),
             true,
         )?;
+        self.trace_logits()?;
         ops::argmax(
             &self.kernels,
             &self.stream,

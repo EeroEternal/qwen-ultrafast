@@ -8,7 +8,9 @@ The target checkpoint is [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface
 
 The following component tests have run on a real RTX 5090 with CUDA 13.3:
 
-- BF16 and NVFP4 W4A16 GEMV.
+- BF16 and NVFP4 W4A16/W4A4 GEMV.
+- NVFP4 activation quantization, byte-exact against FlashInfer on the test fixture.
+- Fused expert gate/up/SwiGLU and down/accumulation, bit-exact against split kernels.
 - Gated DeltaNet causal convolution and FP32 recurrent state update.
 - QSA single-token attention with output gating.
 - PLE token hashing and dilated convolution.
@@ -21,21 +23,21 @@ A small single-layer safetensors fixture has also run through the complete Runti
 
 The complete 48-layer forward and official checkpoint mapping load successfully on all eight GPUs, with 17.13 GiB of resident weights reported on rank zero. Direct execution and a full NCCL + CUDA Graph produce the same 16 official-model tokens, `[11, 353, 2688, 264, 1496, 2812, 3712, 10756, 852, 579, 7157, 279, 1483, 35442, 1578, 4313]`, decoded as `, I'm a high school history teacher who's spent the last fifteen years trying`. A first-layer, real-weight Transformers comparison localizes and verifies the GDN `sigmoid` output gate: the gated recurrence square sums are 32.1577 (Rust) and 32.1585 (reference). SGLang 0.5.21 with deterministic inference produced exactly the same 16 tokens on four consecutive runs. At 64 tokens, the first 25 tokens match before the implementations diverge, so long-sequence numerical parity is not yet established.
 
-The current W4A16 + FP32 NCCL implementation measures **30.76 tokens/s** for 64-token graph replay with `NCCL_ALGO=TREE`. Deterministic SGLang with decode graph and RING measures **53–54 tokens/s** for the same checkpoint and prompt. The current implementation is therefore not yet faster than SGLang. Kernel timelines show substantial FP32 AllReduce waiting, but their durations also include rank imbalance and should not be interpreted as pure network transfer time. BF16 reduction and a four-rank configuration were tested and rejected because they did not provide valid, faster execution. PLE row lookup remains outside the graph; the rest of the model and NCCL reduction can be captured.
+The current fused W4A16 + FP32 NCCL implementation measures **31.95 tokens/s** for 64-token graph replay with `NCCL_ALGO=TREE`. Deterministic SGLang with decode graph and RING measures **53–54 tokens/s** for the same checkpoint and prompt. The current implementation is therefore not yet faster than SGLang. An experimental `--w4a4` path measures **20.12 tokens/s** and does not eliminate the token divergence, so W4A16 remains the default. Layer-by-layer traces through the first 25 steps show smooth numerical accumulation rather than an abrupt cache/state failure; dense-kernel reduction order and quantization differences remain. Kernel timelines show substantial FP32 AllReduce waiting, but their durations also include rank imbalance and should not be interpreted as pure network transfer time. BF16 reduction and a four-rank configuration were tested and rejected because they did not provide valid, faster execution. PLE row lookup remains outside the graph; the rest of the model and NCCL reduction can be captured.
 
 ## Target architecture
 
 - 48 decoder layers: 36 Gated DeltaNet and 12 sparse-attention layers.
 - Four hyper-connection streams, hidden size 2560.
 - 512 routed experts per layer, top 10 per token, plus a shared expert.
-- Official NVFP4 routed experts, initially executed as W4A16 with BF16 activations.
+- Official NVFP4 routed experts, executed as fused W4A16 by default with an optional W4A4 activation path.
 - Official FP8 PLE table with a scalar BF16 scale; rows are fetched on demand.
 - Dense weights replicated per rank and routed experts sharded by `expert_id % world_size`.
 - Greedy decoding on GPU with stable device buffers.
 
 The initial execution limit is 2048 tokens. At this length QSA selects every complete block and the tail, so dense attention is equivalent to the model's sparse selection. Longer contexts require the QSA indexer and are rejected rather than silently run through dense attention.
 
-Vision, learned MTP, W4A4 expert activations, long-context QSA, continuous batching, and the OpenAI-compatible server are not implemented yet.
+Vision, learned MTP, long-context QSA, continuous batching, and the OpenAI-compatible server are not implemented yet.
 
 ## Requirements
 
@@ -55,9 +57,9 @@ compute-sanitizer --tool memcheck ./target/release/test --device=0
 compute-sanitizer --tool racecheck ./target/release/test --device=0
 ```
 
-The latest component report contains zero error for NVFP4 GEMV, convolution, QSA single-token attention, PLE, and router selection. GDN recurrence differs from the CPU reference by approximately `5.96e-8` maximum absolute error after matching canonical BF16 rounding. The PLE hash test also covers signed-int64 remainder semantics after wrapping multiplication.
+The latest component report contains zero error for NVFP4 W4A16/W4A4 GEMV, activation quantization, fused experts, convolution, QSA single-token attention, PLE, and router selection. Fused and split experts are also checked for bit-exact outputs over multiple accumulations. GDN recurrence differs from the CPU reference by approximately `5.96e-8` maximum absolute error after matching canonical BF16 rounding. The PLE hash test also covers signed-int64 remainder semantics after wrapping multiplication.
 
-For direct-mode layer diagnostics, `QWEN_TRACE_VALUES=1` prints stage square sums and the first eight values on rank zero. `python/hf_layer0_reference.py` independently loads the real first layer with Transformers and dequantizes its NVFP4 experts to BF16; it requires a separate Python environment with PyTorch, Transformers, and safetensors. Do not enable value tracing during CUDA Graph capture.
+For direct-mode layer diagnostics, `QWEN_TRACE_VALUES=1` prints stage square sums, the first eight values, and top-10 logits on rank zero. `QWEN_UNFUSED_MOE=1` selects the split-expert A/B path. `QWEN_NVFP4_DUMP=/path/to/fixture.json` exports the quantization fixture for comparison with FlashInfer. `python/hf_layer0_reference.py` independently loads the real first layer with Transformers and dequantizes its NVFP4 experts to BF16; it requires a separate Python environment with PyTorch, Transformers, and safetensors. Do not enable value tracing during CUDA Graph capture.
 
 ## Load the model
 

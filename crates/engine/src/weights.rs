@@ -79,6 +79,8 @@ pub struct MoeWeights {
     pub gate_table: DevicePtr,
     pub up_table: DevicePtr,
     pub down_table: DevicePtr,
+    pub input_scale: f32,
+    pub down_input_scale: f32,
 }
 
 pub struct PleWeights {
@@ -380,6 +382,27 @@ impl Weights {
                 })
             };
             let mlp = format!("{prefix}.mlp");
+            let mut input_scale = 0.0f32;
+            let mut down_input_scale = 0.0f32;
+            for id in 0..text.num_experts {
+                let expert = format!("{mlp}.experts.{id}");
+                for projection in ["gate_proj", "up_proj"] {
+                    let name = format!("{expert}.{projection}.input_scale");
+                    if checkpoint.has(&name) {
+                        input_scale = input_scale.max(checkpoint.f32(&name, &[])?[0]);
+                    }
+                }
+                let name = format!("{expert}.down_proj.input_scale");
+                if checkpoint.has(&name) {
+                    down_input_scale = down_input_scale.max(checkpoint.f32(&name, &[])?[0]);
+                }
+            }
+            if input_scale == 0.0 {
+                input_scale = 1.0;
+            }
+            if down_input_scale == 0.0 {
+                down_input_scale = 1.0;
+            }
             let mut experts = Vec::new();
             for id in (rank..text.num_experts).step_by(world_size) {
                 let expert = format!("{mlp}.experts.{id}");
@@ -409,6 +432,8 @@ impl Weights {
                 gate_table,
                 up_table,
                 down_table,
+                input_scale,
+                down_input_scale,
                 shared_gate_up: loader.merged(
                     &[
                         format!("{mlp}.shared_expert.gate_proj.weight"),
