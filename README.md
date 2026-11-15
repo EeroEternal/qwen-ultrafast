@@ -22,9 +22,9 @@ The component suite passes `cargo clippy --workspace --all-targets -- -D warning
 
 A small single-layer safetensors fixture has also run through the complete Runtime on one, two, and eight GPUs, including tokenizer input, GDN, hyper-connections, MoE, LM head, and greedy token output. All ranks produced token `24251` for the fixture's first decode step. NCCL's fixed-input allreduce returned the expected values on both GPUs. A two-rank, three-token run also completed with all model computation and NCCL collectives captured in one reusable CUDA Graph. The fixture is an execution test, not a substitute for official-model numerical validation.
 
-The complete 48-layer forward and official checkpoint mapping load successfully on all eight GPUs, with 17.13 GiB of resident weights reported on rank zero. Direct execution and a full NCCL + CUDA Graph produce the same 16 official-model tokens, `[11, 353, 2688, 264, 1496, 2812, 3712, 10756, 852, 579, 7157, 279, 1483, 35442, 1578, 4313]`, decoded as `, I'm a high school history teacher who's spent the last fifteen years trying`. A first-layer, real-weight Transformers comparison localizes and verifies the GDN `sigmoid` output gate: the gated recurrence square sums are 32.1577 (Rust) and 32.1585 (reference). SGLang 0.5.21 with deterministic inference produced exactly the same 16 tokens on four consecutive runs. At 64 tokens, the first 25 tokens match before the implementations diverge, so long-sequence numerical parity is not yet established.
+The complete 48-layer forward and official checkpoint mapping load successfully on all eight GPUs, with 17.13 GiB of resident weights reported on rank zero. Direct execution and a full NCCL + CUDA Graph produce exactly the same 64 official-model tokens; the first 16 are `[11, 353, 2688, 264, 1496, 2812, 3712, 10756, 852, 579, 7157, 279, 1483, 35442, 1578, 4313]`, decoded as `, I'm a high school history teacher who's spent the last fifteen years trying`. A first-layer, real-weight Transformers comparison localizes and verifies the GDN `sigmoid` output gate: the gated recurrence square sums are 32.1577 (Rust) and 32.1585 (reference). SGLang 0.5.21 with deterministic inference produced exactly the same 16 tokens on four consecutive runs. The W4A4 references share a 25-token prefix; a purpose-built W4A16 CUTLASS reference extends the matching prefix to 32 tokens. At step 32 the final-hidden square-sum difference is about 0.148%, while Rust's top-two logit gap is only 0.0183 and SGLang's is 0.125, so reduction-order differences can flip argmax. Exact cross-engine 64-token parity is not established, but direct and Graph are 64-token identical.
 
-The current fused W4A16 + FP32 NCCL implementation measures **72.56–75.64 tokens/s** in two independent 64-token graph runs with `NCCL_ALGO=TREE`, exceeding deterministic SGLang's **53–54 tokens/s** with decode graph and RING for the same checkpoint and prompt. Replacing dynamic FP4 lookup tables with exact integer-bit decoding removed the main expert-kernel bottleneck. Parallel router selection, fused four-stream RMSNorm, and parallel GDN state updates provide additional gains while preserving the token sequence. The experimental `--w4a4` path does not eliminate the token divergence, so W4A16 remains the default. Layer-by-layer traces through the first 25 steps show smooth numerical accumulation rather than an abrupt cache/state failure; dense-kernel reduction order and quantization differences remain. Kernel timelines show substantial FP32 AllReduce waiting, but their durations also include rank imbalance and should not be interpreted as pure network transfer time. BF16 reduction and a four-rank configuration were tested and rejected because they did not provide valid, faster execution. PLE row lookup remains outside the graph; the rest of the model and NCCL reduction can be captured.
+The current fused W4A16 + FP32 NCCL implementation measures **72.56–75.64 tokens/s** in two independent 64-token graph runs with `NCCL_ALGO=TREE`, exceeding deterministic SGLang's **53–54 tokens/s** with decode graph and RING for the same checkpoint and prompt. Replacing dynamic FP4 lookup tables with exact integer-bit decoding removed the main expert-kernel bottleneck. Parallel router selection, fused four-stream RMSNorm, and parallel GDN state updates provide additional gains while preserving the token sequence. The experimental `--w4a4` path does not eliminate the token divergence, so W4A16 remains the default. Layer-by-layer traces through the first 32 steps show smooth numerical accumulation rather than an abrupt cache/state failure; dense-kernel reduction order and quantization differences remain. Kernel timelines show substantial FP32 AllReduce waiting, but their durations also include rank imbalance and should not be interpreted as pure network transfer time. BF16 reduction and a four-rank configuration were tested and rejected because they did not provide valid, faster execution. PLE row lookup remains outside the graph; the rest of the model and NCCL reduction can be captured.
 
 ## Target architecture
 
@@ -133,6 +133,20 @@ NCCL_ALGO=RING .venv/bin/sglang serve \
 ```
 
 `python/sglang_generate.py` sends `input_ids=[9419]` with `temperature=0`, `top_k=1`, and `top_p=1`. Port 8000 on this machine belongs to another service; the baseline uses 8001.
+
+For the W4A16 numerical reference, the CUTLASS backend was run with `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`. SGLang 0.5.21 gates this flag to CuteDSL by default, so the local reference temporarily widened the condition in `modelopt_quant.py` to `(self._is_cutedsl_v2_standard or self.enable_flashinfer_cutlass_moe)`. FlashInfer's CUTLASS API explicitly supports NVFP4 weights with unquantized BF16 inputs. The CuteDSL-only path itself does not support SM120. The installed SGLang source was restored after measurement.
+
+Use `python/numerical_compare.py` to record the exact prefix instead of relying on generated text. A nonzero `--require-prefix` makes the check fail when the required reference agreement is not met.
+
+```bash
+.venv/bin/python python/numerical_compare.py \
+  --rust /tmp/rust-direct.json \
+  --reference /tmp/sglang-w4a16.json --require-prefix 32
+
+.venv/bin/python python/numerical_compare.py \
+  --rust /tmp/rust-direct.json \
+  --reference /tmp/rust-graph.json --reference-key tokens --require-prefix 64
+```
 
 ## Layout
 
