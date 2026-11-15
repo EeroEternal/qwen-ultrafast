@@ -411,6 +411,43 @@ fn nvfp4_quantize_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
     Ok(0.0)
 }
 
+fn rmsnorm_streams_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
+    let columns = 2560;
+    let streams = 4;
+    let input = Buffer::from_host(&reference::values(columns * streams, 101))?;
+    let weight = Buffer::from_host(&reference::values(columns * streams, 103))?;
+    let expected = Buffer::<bf16>::alloc(columns * streams)?;
+    let actual = Buffer::<bf16>::alloc(columns * streams)?;
+    for index in 0..streams {
+        let offset = (index * columns * 2) as u64;
+        qwen_ultrafast_engine::ops::rmsnorm(
+            kernels,
+            stream,
+            input.ptr() + offset,
+            weight.ptr() + offset,
+            expected.ptr() + offset,
+            columns,
+            1e-6,
+        )?;
+    }
+    qwen_ultrafast_engine::ops::rmsnorm_streams(
+        kernels,
+        stream,
+        input.ptr(),
+        weight.ptr(),
+        actual.ptr(),
+        columns,
+        streams,
+        1e-6,
+    )?;
+    stream.synchronize()?;
+    ensure!(
+        actual.download()? == expected.download()?,
+        "stream RMSNorm is not bit-exact with separate launches"
+    );
+    Ok(0.0)
+}
+
 fn router_test(kernels: &Kernels, stream: &Stream) -> Result<f32> {
     let logits_host = reference::values(512, 37);
     let logits = Buffer::from_host(&logits_host)?;
@@ -669,6 +706,7 @@ fn main() -> Result<()> {
         nvfp4_quantize_test(&kernels, &stream)?,
     );
     errors.insert("router_top10", router_test(&kernels, &stream)?);
+    errors.insert("rmsnorm_streams", rmsnorm_streams_test(&kernels, &stream)?);
     errors.insert("gdn_convolution", gdn_conv_test(&kernels, &stream)?);
     errors.insert("qsa_single_token", qsa_test(&kernels, &stream)?);
     errors.insert("ple_hash_and_convolution", ple_test(&kernels, &stream)?);

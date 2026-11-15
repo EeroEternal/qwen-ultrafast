@@ -176,6 +176,37 @@ extern "C" __global__ void __launch_bounds__(256) qwen_rmsnorm(
     }
 }
 
+extern "C" __global__ void __launch_bounds__(256) qwen_rmsnorm_streams(
+    const bf16* input,
+    const bf16* weight,
+    bf16* output,
+    unsigned int columns,
+    float epsilon
+) {
+    const unsigned int offset = blockIdx.x * columns;
+    input += offset;
+    weight += offset;
+    output += offset;
+    const uint4* input_vec = reinterpret_cast<const uint4*>(input);
+    float square_sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < columns / 8; i += blockDim.x) {
+        const uint4 packed = input_vec[i];
+        const bf16* values = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float value = to_float(values[j]);
+            square_sum = fmaf(value, value, square_sum);
+        }
+    }
+    __shared__ float reduction[32];
+    const float inverse_rms = rsqrtf(
+        block_sum(square_sum, reduction) / static_cast<float>(columns) + epsilon
+    );
+    for (unsigned int i = threadIdx.x; i < columns; i += blockDim.x) {
+        output[i] = from_float(to_float(input[i]) * inverse_rms * (1.0f + to_float(weight[i])));
+    }
+}
+
 extern "C" __global__ void qwen_add(
     const bf16* lhs,
     const bf16* rhs,

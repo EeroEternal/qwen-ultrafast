@@ -246,19 +246,16 @@ impl<'a> Runtime<'a> {
         output: DevicePtr,
     ) -> Result<()> {
         let text = &self.config.text_config;
-        for stream in 0..text.hc_count {
-            let offset = (stream * text.hidden_size * 2) as u64;
-            ops::rmsnorm(
-                &self.kernels,
-                &self.stream,
-                input + offset,
-                weight + offset,
-                output + offset,
-                text.hidden_size,
-                text.rms_norm_eps,
-            )?;
-        }
-        Ok(())
+        ops::rmsnorm_streams(
+            &self.kernels,
+            &self.stream,
+            input,
+            weight,
+            output,
+            text.hidden_size,
+            text.hc_count,
+            text.rms_norm_eps,
+        )
     }
 
     fn hyper_connection(&mut self, weights: &HyperConnectionWeights) -> Result<()> {

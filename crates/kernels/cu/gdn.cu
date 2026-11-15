@@ -25,7 +25,7 @@ extern "C" __global__ void qwen_gdn_conv(
     output[channel] = from_float(silu(value));
 }
 
-extern "C" __global__ void __launch_bounds__(256) qwen_gdn_recurrence(
+extern "C" __global__ void __launch_bounds__(1024) qwen_gdn_recurrence(
     const bf16* qkv,
     const bf16* z,
     const bf16* a,
@@ -44,10 +44,16 @@ extern "C" __global__ void __launch_bounds__(256) qwen_gdn_recurrence(
     __shared__ float query[128];
     __shared__ float key[128];
     __shared__ float reduction[32];
+    __shared__ float delta_values[128];
+    __shared__ float raw_values[128];
+    __shared__ float decay;
+    __shared__ float beta;
     const unsigned int head = blockIdx.x;
     const unsigned int key_head = head / (value_heads / key_heads);
     const unsigned int key_dim = key_heads * head_dim;
     const unsigned int tid = threadIdx.x;
+    const unsigned int value_index = tid & 127;
+    const unsigned int group = tid >> 7;
     if (tid < head_dim) {
         query[tid] = to_float(qkv[key_head * head_dim + tid]);
         key[tid] = to_float(qkv[key_dim + key_head * head_dim + tid]);
@@ -64,37 +70,48 @@ extern "C" __global__ void __launch_bounds__(256) qwen_gdn_recurrence(
         query[tid] *= q_norm * rsqrtf(static_cast<float>(head_dim));
         key[tid] *= k_norm;
     }
+    if (tid == 0) {
+        decay = expf(-expf(a_log[head]) * log1pf(expf(to_float(a[head]) + dt_bias[head])));
+        beta = sigmoid(to_float(b[head]));
+    }
     __syncthreads();
-    float result = 0.0f;
-    if (tid < head_dim) {
-        float* state = recurrent_state + static_cast<size_t>(head) * head_dim * head_dim;
-        const float decay = expf(-expf(a_log[head]) * log1pf(expf(to_float(a[head]) + dt_bias[head])));
-        const float beta = sigmoid(to_float(b[head]));
-        const float value = to_float(qkv[2 * key_dim + head * head_dim + tid]);
+    float* state = recurrent_state + static_cast<size_t>(head) * head_dim * head_dim;
+    for (unsigned int k = group; k < head_dim; k += 8) {
+        state[k * head_dim + value_index] *= decay;
+    }
+    __syncthreads();
+    if (group == 0) {
         float memory = 0.0f;
         for (unsigned int k = 0; k < head_dim; ++k) {
-            float& cell = state[k * head_dim + tid];
-            cell *= decay;
-            memory = fmaf(cell, key[k], memory);
+            memory = fmaf(state[k * head_dim + value_index], key[k], memory);
         }
-        const float delta = (value - memory) * beta;
+        const float value = to_float(qkv[2 * key_dim + head * head_dim + value_index]);
+        delta_values[value_index] = (value - memory) * beta;
+    }
+    __syncthreads();
+    const float delta = delta_values[value_index];
+    for (unsigned int k = group; k < head_dim; k += 8) {
+        state[k * head_dim + value_index] = fmaf(key[k], delta, state[k * head_dim + value_index]);
+    }
+    __syncthreads();
+    if (group == 0) {
+        float result = 0.0f;
         for (unsigned int k = 0; k < head_dim; ++k) {
-            float& cell = state[k * head_dim + tid];
-            cell = fmaf(key[k], delta, cell);
-            result = fmaf(cell, query[k], result);
+            result = fmaf(state[k * head_dim + value_index], query[k], result);
+        }
+        const bf16 rounded = from_float(result);
+        raw_values[value_index] = to_float(rounded);
+        if (raw_output != nullptr) {
+            raw_output[head * head_dim + value_index] = rounded;
         }
     }
-    const bf16 rounded_result = from_float(result);
-    if (raw_output != nullptr && tid < head_dim) {
-        raw_output[head * head_dim + tid] = rounded_result;
-    }
-    const float variance_input = to_float(rounded_result);
+    const float variance_input = group == 0 ? raw_values[value_index] : 0.0f;
     const float inverse_rms = rsqrtf(block_sum(variance_input * variance_input, reduction) /
         static_cast<float>(head_dim) + epsilon);
-    if (tid < head_dim) {
+    if (group == 0) {
         const bf16 normalized = from_float(variance_input * inverse_rms);
-        const float gated = to_float(normalized) * to_float(norm[tid]) *
-            sigmoid(to_float(z[head * head_dim + tid]));
-        output[head * head_dim + tid] = from_float(gated);
+        const float gated = to_float(normalized) * to_float(norm[value_index]) *
+            sigmoid(to_float(z[head * head_dim + value_index]));
+        output[head * head_dim + value_index] = from_float(gated);
     }
 }

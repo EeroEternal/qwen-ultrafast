@@ -108,6 +108,37 @@ pub fn rmsnorm(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_streams(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    columns: usize,
+    streams: usize,
+    epsilon: f32,
+) -> Result<()> {
+    let mut args = Args::new()
+        .u64(input)
+        .u64(weight)
+        .u64(output)
+        .u32(columns as u32)
+        .f32(epsilon);
+    unsafe {
+        launch(
+            kernels.rmsnorm_streams,
+            Launch {
+                grid: (streams as u32, 1, 1),
+                block: (256, 1, 1),
+                shared_bytes: 0,
+            },
+            stream,
+            &mut args,
+        )
+    }
+}
+
 pub fn add(
     kernels: &Kernels,
     stream: &Stream,

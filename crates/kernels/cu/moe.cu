@@ -16,26 +16,32 @@ extern "C" __global__ void __launch_bounds__(512) qwen_router_topk(
     probabilities[expert] = probability;
     const float sum = block_sum(probability, reduction);
     probabilities[expert] = probability / sum;
-    __syncthreads();
+    __shared__ unsigned int selected;
+    __shared__ float selected_sum;
     if (expert == 0) {
-        float selected_sum = 0.0f;
-        for (unsigned int slot = 0; slot < top_k; ++slot) {
-            float best = -1.0f;
-            unsigned int best_expert = experts;
-            for (unsigned int candidate = 0; candidate < experts; ++candidate) {
-                if (probabilities[candidate] > best) {
-                    best = probabilities[candidate];
-                    best_expert = candidate;
-                }
-            }
-            expert_ids[slot] = best_expert;
+        selected_sum = 0.0f;
+    }
+    __syncthreads();
+    for (unsigned int slot = 0; slot < top_k; ++slot) {
+        const float best = block_max(probabilities[expert], reduction);
+        if (expert == 0) {
+            selected = experts;
+        }
+        __syncthreads();
+        if (probabilities[expert] == best) {
+            atomicMin(&selected, expert);
+        }
+        __syncthreads();
+        if (expert == 0) {
+            expert_ids[slot] = selected;
             expert_weights[slot] = best;
-            probabilities[best_expert] = -1.0f;
+            probabilities[selected] = -1.0f;
             selected_sum += best;
         }
-        for (unsigned int slot = 0; slot < top_k; ++slot) {
-            expert_weights[slot] /= selected_sum;
-        }
+        __syncthreads();
+    }
+    if (expert < top_k) {
+        expert_weights[expert] /= selected_sum;
     }
 }
 

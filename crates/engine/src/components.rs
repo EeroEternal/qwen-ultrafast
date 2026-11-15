@@ -70,7 +70,7 @@ pub fn gdn_recurrence(
         kernels.gdn_recurrence,
         stream,
         (value_heads as u32, 1, 1),
-        256,
+        1024,
         &mut Args::new()
             .u64(qkv)
             .u64(z)

@@ -30,11 +30,14 @@ __device__ __forceinline__ float fp8_to_float(uint8_t value) {
 }
 
 __device__ __forceinline__ float fp4_to_float(unsigned int value) {
-    const float values[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    return values[value & 15];
+    const unsigned int code = value & 15;
+    const unsigned int exponent = (code >> 1) & 3;
+    const unsigned int mantissa = code & 1;
+    const uint16_t bits = static_cast<uint16_t>(
+        ((code & 8) << 12) |
+        (exponent == 0 ? mantissa * 0x3800 : ((exponent + 14) << 10) | (mantissa << 9))
+    );
+    return __half2float(__ushort_as_half(bits));
 }
 
 __device__ __forceinline__ float block_sum(float value, float* shared) {
