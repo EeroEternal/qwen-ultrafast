@@ -129,7 +129,7 @@ __device__ __forceinline__ void gemv(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(128) qwen_gemv_bf16(
+extern "C" __global__ void __launch_bounds__(512) qwen_gemv_bf16(
     const bf16* input,
     const bf16* weight,
     bf16* output,
@@ -139,7 +139,7 @@ extern "C" __global__ void __launch_bounds__(128) qwen_gemv_bf16(
     gemv<false>(input, weight, output, n, k);
 }
 
-extern "C" __global__ void __launch_bounds__(128) qwen_gemv_f32(
+extern "C" __global__ void __launch_bounds__(512) qwen_gemv_f32(
     const bf16* input,
     const bf16* weight,
     float* output,

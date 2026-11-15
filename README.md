@@ -62,6 +62,19 @@ The latest component report contains zero error for NVFP4 W4A16/W4A4 GEMV, activ
 
 For direct-mode layer diagnostics, `QWEN_TRACE_VALUES=1` prints stage square sums, the first eight values, and top-10 logits on rank zero. `QWEN_UNFUSED_MOE=1` selects the split-expert A/B path. `QWEN_NVFP4_DUMP=/path/to/fixture.json` exports the quantization fixture for comparison with FlashInfer. `python/hf_layer0_reference.py` independently loads the real first layer with Transformers and dequantizes its NVFP4 experts to BF16; it requires a separate Python environment with PyTorch, Transformers, and safetensors. Do not enable value tracing during CUDA Graph capture.
 
+## GEMV benchmark and Evolith
+
+`kernel_bench` checks the BF16 GEMV output against a CPU reference and records alternating CUDA-event timings for a controlled block size. Allowed values are 64, 128, 256, and 512 threads; the runtime default is 128 unless a full-model comparison demonstrates a better incumbent.
+
+```bash
+target/release/kernel_bench --threads 256 --baseline-threads 128 --rounds 19 --iterations 128
+QWEN_GEMV_THREADS=256 target/release/run \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  --gpus 0,1,2,3,4,5,6,7 --prompt Hello --decode 64 --max-seq 80 --graph
+```
+
+The [Evolith](https://github.com/EeroEternal/evolith) `qwen-ultrafast` command can search this bounded space remotely. It requires microbenchmark acceptance, exact 64-token equality with the current incumbent, and a passing full-model AB/BA timing gate before reporting a successor. It does not change the runtime default automatically.
+
 ## Load the model
 
 ```bash

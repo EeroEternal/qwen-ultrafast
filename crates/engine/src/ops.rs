@@ -47,6 +47,30 @@ pub fn gemv(
     output: DevicePtr,
     float_output: bool,
 ) -> Result<()> {
+    let threads = std::env::var("QWEN_GEMV_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128);
+    gemv_with_threads(
+        kernels,
+        stream,
+        input,
+        weight,
+        output,
+        float_output,
+        threads,
+    )
+}
+
+pub fn gemv_with_threads(
+    kernels: &Kernels,
+    stream: &Stream,
+    input: DevicePtr,
+    weight: Matrix,
+    output: DevicePtr,
+    float_output: bool,
+    threads: u32,
+) -> Result<()> {
     ensure!(
         weight.n > 0 && weight.n <= u32::MAX as usize,
         "invalid GEMV rows"
@@ -54,6 +78,10 @@ pub fn gemv(
     ensure!(
         weight.k > 0 && weight.k % 8 == 0,
         "GEMV K must be a multiple of eight"
+    );
+    ensure!(
+        matches!(threads, 64 | 128 | 256 | 512),
+        "GEMV threads must be 64, 128, 256, or 512"
     );
     let mut args = Args::new()
         .u64(input)
@@ -70,7 +98,7 @@ pub fn gemv(
             },
             Launch {
                 grid: (weight.n as u32, 1, 1),
-                block: (128, 1, 1),
+                block: (threads, 1, 1),
                 shared_bytes: 0,
             },
             stream,
