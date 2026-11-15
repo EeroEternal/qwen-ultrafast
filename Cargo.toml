@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/cuda", "crates/kernels", "crates/model", "crates/nccl", "crates/engine"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cuda-13000", "dynamic-loading"] }
+half = "2"
+libloading = "0.9"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
